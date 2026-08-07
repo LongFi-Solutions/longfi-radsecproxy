@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# longfi-fetch — neofetch-style status banner for a LongFi RadSecProxy deployment.
+#
+# Standalone: neofetch is NOT required. Only uses tools already present on a stock
+# Ubuntu/Debian box — hostname, uname, free, df, docker, openssl.
+#
+# Every lookup degrades to "n/a" rather than failing, so this is safe to run on a
+# half-configured machine. Docker queries and reading the certificates need root, so
+# run with sudo for a complete picture:
+#
+#   sudo longfi-fetch
+
+REPO_DIR="${REPO_DIR:-/opt/longfi-radsecproxy}"
+CONF="$REPO_DIR/radsecproxy.conf"
+
+# ---- brand colours ----------------------------------------------------------
+# Truecolor escapes. Adjust brightness by editing the RGB triplets — both tones share
+# their original hue and were lifted together, so keep them moving together. They must
+# stay distinguishable from each other or the interlocking chevrons stop reading as two
+# shapes and the logo turns into a blob.
+#
+#   B (royal blue)  #3A63D8   was #2647A9
+#   N (navy)        #4242A8   was #2E2E7A
+B=$'\033[38;2;58;99;216m'
+N=$'\033[38;2;66;66;168m'
+BOLD=$'\033[1m'
+AMBER=$'\033[38;2;220;160;40m'   # certificate expiry warning
+R=$'\033[0m'
+
+q() { "$@" 2>/dev/null || true; }
+
+ART=(
+  "                    ${B}__${R}                    "
+  "                 ${B}_@@@@@@_${R}                 "
+  "             ${B}_g@@@@@@@@@@@@g_${R}             "
+  "          ${B}_@@@@@@@@@@@@@@@@@@@@_${R}          "
+  "      ${N}_og_.${B}\"B@@@@@@@@@@@@@@@@@@@@@g_${R}      "
+  "   ${N}_@@@@@@@@a_ ${B}<@@@@@@@@@@@@@@@@@@@@@@a${R}   "
+  " ${N}@@@@@@@@@@@@@@g_ ${B}\"0@@@@@@@@@@@@@@@@@@@@@${R} "
+  " ${N}@@@@@@@@@@@@@@@@@@ ${R}  ${B}<@@@@@@@@@@@@@@@@@@${R} "
+  " ${N}[@@@@@@@@@@@@@P${R}         ${B}\"0@@@@@@@@@@@@@@${R} "
+  " ${N}[@@@@@@@@@B\"${R}                ${B}@@@@@@@@@@@@${R} "
+  " ${N}[@@@@@@\"${R} ${B}_g@${R}                ${B}@@@@@@@@@P ${N},${R} "
+  " ${N}[@@D' ${B}_@@@@@${R}                ${B}@@@@@B\" ${N}_g@g${R} "
+  " ${N}>${R} ${B}_o@@@@@@@@${R}                ${B}@@P ${N}__@@@@@g${R} "
+  " ${B}@@@@@@@@@@@@${R}                 ${N}_g@@@@@@@@g${R} "
+  " ${B}@@@@@@@@@@@@@g_${R}          ${N}__@@@@@@@@@@@@g${R} "
+  " ${B}@@@@@@@@@@@@@@@@@_${R}    ${N}_@@@@@@@@@@@@@@@@g${R} "
+  " ${B}@@@@@@@@@@@@@@@@@@@@g_ ${N}\"8@@@@@@@@@@@@@@g${R} "
+  "  ${B}<@@@@@@@@@@@@@@@@@@@@@@__${N}\`+@@@@@@@@@B\"${R}  "
+  "     ${B}\"8@@@@@@@@@@@@@@@@@@@@@g_ ${N}\"8@@P${R}      "
+  "         ${B}<@@@@@@@@@@@@@@@@@@@@@@>${R}         "
+  "             ${B}4@@@@@@@@@@@@@@P${R}             "
+  "                ${B}\"@@@@@@@@\"${R}                "
+  "                    ${B}4P${R}                    "
+)
+
+# ---- system -----------------------------------------------------------------
+HOSTNAME_="$(q hostname)"
+OS="$( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" )"
+[ -n "$OS" ] && OS="$OS $(q uname -m)"
+KERNEL="$(q uname -r)"
+UPTIME="$(q uptime -p | sed 's/^up //')"
+CPU="$(q grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+CORES="$(q nproc)"
+[ -n "$CPU" ] && CPU="$CPU ($CORES)"
+MEM="$(q free -m | awk '/^Mem:/{printf "%dMiB / %dMiB", $3, $2}')"
+DISK="$(q df -h / | awk 'NR==2{printf "%s / %s (%s)", $3, $2, $5}')"
+
+# ---- container stack --------------------------------------------------------
+DOCKER="$(q docker --version | sed 's/Docker version //; s/,.*//')"
+COMPOSE="$(q docker compose version --short)"
+STATE="$(q docker inspect -f '{{.State.Status}}' radsecproxy)"
+[ -z "$STATE" ] && STATE="not running"
+SINCE="$(q docker inspect -f '{{.State.StartedAt}}' radsecproxy | cut -dT -f1)"
+[ -n "$SINCE" ] && STATE="$STATE (since $SINCE)"
+IMAGE="$(q docker inspect -f '{{.Config.Image}}' radsecproxy)"
+
+# radsecproxy logs to STDERR, and `docker logs` mirrors the container's streams — so
+# stderr has to be folded in here. Redirecting it away (as the q() helper does) leaves
+# this empty and every field below reads n/a on a perfectly healthy container.
+#
+# Two windows, because the startup banner scrolls out of any reasonable tail once the
+# proxy has been up for a few hours: the head for version and the original connection,
+# a short tail for current liveness.
+LOG_START="$(docker logs radsecproxy 2>&1 | head -60 || true)"
+LOG_RECENT="$(docker logs radsecproxy --tail 300 2>&1 || true)"
+
+VERSION="$(echo "$LOG_START" | grep -o 'radsecproxy [0-9][0-9.]* starting' | tail -1 | awk '{print $2}')"
+
+# ---- proxy config -----------------------------------------------------------
+UPSTREAM="$(q grep -A2 "^server 'longfi'" "$CONF" | grep -o "host '[^']*'" | cut -d"'" -f2)"
+LISTEN="$(q grep -o "ListenUDP '[^']*'" "$CONF" | cut -d"'" -f2 | sed 's/.*://' | paste -sd'/' -)"
+REALMS="$(q grep -c '^realm ' "$CONF")"
+
+# Prefer a recent reconnect if there is one, otherwise fall back to the original
+# connection from startup — on a link that has been stable for hours the only
+# "connection up" line is the one at the very beginning of the log.
+TLSLINE="$(echo "$LOG_RECENT" | grep 'TLS connection to longfi' | tail -1)"
+[ -z "$TLSLINE" ] && TLSLINE="$(echo "$LOG_START" | grep 'TLS connection to longfi' | tail -1)"
+if [ -n "$TLSLINE" ]; then
+  TLSVER="$(echo "$TLSLINE" | grep -o 'TLSv1\.[0-9]')"
+  CIPHER="$(echo "$TLSLINE" | sed -n 's/.*with cipher \([A-Z0-9_]*\).*/\1/p')"
+  TUNNEL="up"
+else
+  TUNNEL="down"
+fi
+
+# The timestamp of the most recent status-server reply answers "is this link alive right
+# now", which a running total does not — a big count is equally consistent with a tunnel
+# that died an hour ago. radsecproxy log format: "Wed Aug  5 22:06:58 2026: replyh: ..."
+LASTBEAT="$(echo "$LOG_RECENT" | grep 'status server response from longfi' | tail -1 | awk '{print $2, $3, $4}')"
+
+CA_CN="$(q openssl x509 -noout -subject -in "$REPO_DIR/certs/ca.pem" | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')"
+CLIENT_CN="$(q openssl x509 -noout -subject -in "$REPO_DIR/certs/cert.pem" | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')"
+
+# Client certificate validity. Only the certificate carries dates — the private key has
+# no expiry of its own, so there is nothing separate to report for key.pem. Client certs
+# are issued with a 3 year lifetime, and the countdown turns amber inside 90 days.
+EXPIRY=""
+RAW_END="$(q openssl x509 -noout -enddate -in "$REPO_DIR/certs/cert.pem" | cut -d= -f2)"
+if [ -n "$RAW_END" ]; then
+  PRETTY_END="$(q date -d "$RAW_END" +%Y-%m-%d)"
+  [ -z "$PRETTY_END" ] && PRETTY_END="$RAW_END"
+  END_EPOCH="$(q date -d "$RAW_END" +%s)"
+  if [ -n "$END_EPOCH" ]; then
+    DAYS_LEFT=$(( (END_EPOCH - $(date +%s)) / 86400 ))
+    if [ "$DAYS_LEFT" -lt 0 ]; then
+      EXPIRY="${AMBER}${PRETTY_END} — EXPIRED${R}"
+    elif [ "$DAYS_LEFT" -lt 90 ]; then
+      EXPIRY="${AMBER}${PRETTY_END} (${DAYS_LEFT} days left)${R}"
+    else
+      EXPIRY="${PRETTY_END} (${DAYS_LEFT} days left)"
+    fi
+  else
+    EXPIRY="$PRETTY_END"
+  fi
+fi
+
+# ---- assemble ---------------------------------------------------------------
+row() { INFO+=("${BOLD}${B}$1${R}${2:+: }$2"); }
+SEP="${N}$(printf '%.0s-' $(seq 1 34))${R}"
+
+INFO=()
+row "LongFi Solutions" ""
+INFO+=("$SEP")
+row "radsecproxy@${HOSTNAME_:-unknown}" ""
+INFO+=("$SEP")
+row "OS"          "${OS:-n/a}"
+row "Kernel"      "${KERNEL:-n/a}"
+row "Uptime"      "${UPTIME:-n/a}"
+row "CPU"         "${CPU:-n/a}"
+row "Memory"      "${MEM:-n/a}"
+row "Disk"        "${DISK:-n/a}"
+INFO+=("")
+row "Docker"      "${DOCKER:-n/a}"
+row "Compose"     "${COMPOSE:-n/a}"
+row "Container"   "$STATE"
+row "Image"       "${IMAGE:-n/a}"
+row "RadSecProxy" "${VERSION:-n/a}"
+INFO+=("")
+row "Upstream"    "${UPSTREAM:-n/a}:2083"
+row "Tunnel"      "$TUNNEL${TLSVER:+ — $TLSVER}"
+row "Cipher"      "${CIPHER:-n/a}"
+row "Last beat"   "${LASTBEAT:-n/a}"
+row "Listening"   "UDP ${LISTEN:-n/a}"
+row "Realms"      "${REALMS:-0} configured"
+INFO+=("")
+row "Client cert" "${CLIENT_CN:-n/a}"
+row "Cert expires" "${EXPIRY:-n/a}"
+row "Issuing CA"  "${CA_CN:-n/a}"
+INFO+=("")
+row "Repo"        "github.com/LongFi-Solutions/longfi-radsecproxy"
+row "Support & renewals" "support@longfisolutions.com"
+
+# ANSI palette bar — the 16 standard terminal colours as background blocks. Top row is
+# normal intensity (black, red, green, yellow, blue, magenta, cyan, white), bottom row
+# the bright variants. Built as strings so they sit in the right-hand column with the
+# rest of the readout rather than as a footer under the logo.
+#
+# Useful beyond decoration: if these render monochrome or wrong on a serial console or
+# KVM, the problem is the terminal rather than anything here.
+BAR1=""; BAR2=""
+for i in $(seq 0 7);  do BAR1+=$'\033[48;5;'"$i"'m   '; done; BAR1+="$R"
+for i in $(seq 8 15); do BAR2+=$'\033[48;5;'"$i"'m   '; done; BAR2+="$R"
+
+RIGHT=("${INFO[@]}" "" "$BAR1" "$BAR2")
+
+# The readout is taller than the logo, so centre the logo against it vertically —
+# integer division floors, which leaves any odd row below the logo rather than above.
+rows=${#RIGHT[@]}
+[ ${#ART[@]} -gt "$rows" ] && rows=${#ART[@]}
+OFFSET=$(( (rows - ${#ART[@]}) / 2 ))
+[ "$OFFSET" -lt 0 ] && OFFSET=0
+
+# Measure the logo's real width by stripping the escapes off one row, rather than
+# hardcoding it. A hardcoded value silently drifts if the art is regenerated at a
+# different size, and the symptom — rows without art sitting one column left of the
+# rest — is easy to stare past.
+ART_PLAIN="$(printf '%s' "${ART[0]}" | sed $'s/\033\\[[0-9;]*m//g')"
+BLANK="$(printf "%${#ART_PLAIN}s" '')"
+
+echo
+for ((i = 0; i < rows; i++)); do
+  ai=$(( i - OFFSET ))
+  if [ "$ai" -ge 0 ] && [ "$ai" -lt ${#ART[@]} ]; then
+    left="${ART[ai]}"
+  else
+    left="$BLANK"
+  fi
+  printf '%s  %s\n' "$left" "${RIGHT[i]:-}"
+done
+echo

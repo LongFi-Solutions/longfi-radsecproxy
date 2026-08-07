@@ -1,0 +1,20 @@
+services:
+  radsecproxy:
+    build: .
+    image: longfi-radsecproxy
+    container_name: radsecproxy
+    restart: unless-stopped
+    ports:
+      - "1812:1812/udp"
+      - "1813:1813/udp"
+    volumes:
+      # Config and certs are mounted rather than baked into the image, so an edit takes
+      # effect on `docker compose restart` with no rebuild — and the shared secret never
+      # ends up in an image layer.
+      - ./radsecproxy.conf:/etc/radsecproxy/radsecproxy.conf:ro
+      - ./certs:/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
