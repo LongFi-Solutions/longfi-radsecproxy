@@ -274,8 +274,34 @@ Start with `sudo longfi-fetch` — it shows the tunnel state, certificates and e
 | Tunnel never comes up | Outbound TCP 2083 blocked, or DNS cannot resolve `connect.longfisolutions.com` |
 | `certificate verify failed` | Wrong `ca.pem`, or the certificates are not the ones LongFi issued you |
 | Access points rejected, tunnel healthy | Shared secret mismatch. Check `grep secret radsecproxy.conf` against your controller |
-| Config edit had no effect | You edited a copy elsewhere — the mounted file is the one in this directory |
+| Config edit had no effect | Either you edited a copy elsewhere — the mounted file is the one in this directory — or the container predates config mounting. See below |
 | `longfi-fetch` shows `n/a` everywhere | Run it with `sudo`, or set `REPO_DIR` if the repository is not in `/opt/longfi-radsecproxy` |
+
+### A config change that appears to deploy and does not
+
+Early builds of this container copied `radsecproxy.conf` into the image instead of mounting
+it. On those, editing the file and restarting does nothing — the container keeps running the
+configuration it was built with, with no error and nothing in the logs. Rotating a shared
+secret looks like it succeeded while the old one stays live.
+
+One command tells you which you have:
+
+```bash
+sudo docker inspect radsecproxy --format '{{json .Mounts}}'
+```
+
+**Two** mounts — `radsecproxy.conf` and `certs` — is correct. **One** mount, certs only, means
+the config is baked in and your edits are not being read.
+
+To fix it, replace `docker-compose.yml` and `Dockerfile` with the current versions from this
+repository, then rebuild. A restart is not enough, because both the image and the volume list
+change:
+
+```bash
+sudo docker compose up -d --build
+```
+
+Re-run the inspect afterwards to confirm two mounts.
 
 Full logs:
 
