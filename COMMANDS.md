@@ -32,7 +32,7 @@ now.
 |---|---|---|
 | up | recent | Healthy |
 | down | within the last few minutes | Healthy. Ignore the tunnel line |
-| down | hours old, or `n/a` | Genuinely down, work through the section below |
+| down | hours old, or `n/a` | Genuinely down, see [The tunnel is genuinely down](#the-tunnel-is-genuinely-down) |
 
 If every field reads `n/a`, you did not use `sudo`, or the repository is not in
 `/opt/longfi-radsecproxy`:
@@ -43,9 +43,175 @@ sudo REPO_DIR=/path/to/longfi-radsecproxy longfi-fetch
 
 ---
 
+## Everyday checks
+
+For a deployment that is up and working. All of these are read-only.
+
+**Is the container running:**
+
+```bash
+sudo docker compose ps
+```
+
+**Follow the log live:**
+
+```bash
+sudo docker compose logs -f radsecproxy
+```
+
+**Last 100 lines:**
+
+```bash
+sudo docker compose logs --tail=100 radsecproxy
+```
+
+**Is the link alive right now:**
+
+```bash
+sudo docker logs radsecproxy --tail 300 2>&1 | grep 'status server response from longfi' | tail -1
+```
+
+A timestamp within the last few minutes means the tunnel is up, whatever `longfi-fetch`
+reports for `Tunnel`.
+
+**Tunnel connections and reconnects in the last 24 hours:**
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep 'TLS connection to longfi'
+```
+
+No output is normal and good. The proxy logs this when it connects, so a stable link that
+has not reconnected in 24 hours produces nothing. Repeated lines through the day mean the
+tunnel is flapping, which is worth reporting.
+
+**Anything that looks like a problem:**
+
+```bash
+sudo docker compose logs --tail=500 radsecproxy | grep -iE 'error|fail|unable|denied|refused'
+```
+
+---
+
+## Traffic and health counts
+
+radsecproxy is a proxy. It keeps no session table, so there is no "currently active
+sessions" figure to read anywhere. Everything below is counted from the container log over
+a time window.
+
+Two things shape every number here:
+
+- Docker keeps roughly the last 30 MB of log (`max-size: 10m`, `max-file: 3`). On a busy
+  site that can be well under 24 hours, so **a 24 hour count is a floor, not a total.**
+- radsecproxy logs to stderr, so `2>&1` is required. Without it every command below returns
+  nothing on a perfectly healthy container.
+
+These use `docker logs` rather than `docker compose logs` because compose prefixes each
+line with the service name, which breaks the column-based commands further down.
+
+### What your log actually contains
+
+Run this once per deployment before relying on the counts. Log content varies with
+radsecproxy version and `LogLevel`, and this tells you which of the commands below will
+return anything:
+
+```bash
+sudo docker logs radsecproxy --tail 2000 2>&1 | grep -oE 'Access-[A-Za-z]+|Accounting-[A-Za-z]+' | sort | uniq -c | sort -rn
+```
+
+If that prints nothing, the log is not recording per-packet lines and only the tunnel and
+heartbeat commands will be useful.
+
+### Message mix over a window
+
+Last hour:
+
+```bash
+sudo docker logs radsecproxy --since 1h 2>&1 | grep -oE 'Access-[A-Za-z]+|Accounting-[A-Za-z]+' | sort | uniq -c | sort -rn
+```
+
+Last 24 hours, same shape:
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep -oE 'Access-[A-Za-z]+|Accounting-[A-Za-z]+' | sort | uniq -c | sort -rn
+```
+
+### Accept versus reject
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep -c 'Access-Accept'
+```
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep -c 'Access-Reject'
+```
+
+Expect noticeably more Access-Requests than Accepts. EAP-AKA is multi-round, so a single
+successful carrier authentication is roughly two Access-Requests and one Accept. A ratio
+far above that, or a Reject count climbing, is the signal worth acting on.
+
+### Connections by carrier and realm
+
+Realm distribution, which is the most reliable way to break traffic down by carrier:
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep -oE '@[A-Za-z0-9._-]+' | sort | uniq -c | sort -rn | head -20
+```
+
+AT&T specifically (its three realms are `mnc410`, `mnc280` and `mnc150` under `mcc310`):
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep -cE 'mnc(410|280|150)\.mcc310'
+```
+
+Both depend on usernames appearing in the log. If the realm command above returns nothing,
+they are not being logged at this `LogLevel` and per-carrier counts are not available from
+the log.
+
+### Access points seen
+
+Distinct addresses appearing in the window. This includes the upstream and the container's
+own addresses, so subtract those; what remains are your access points or controller:
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u
+```
+
+### Traffic by hour
+
+A quick shape-of-the-day histogram. Useful for "is it busy, or has it stopped":
+
+```bash
+sudo docker logs radsecproxy --since 24h 2>&1 | grep 'Access-Request' | awk '{print $2, $3, $4}' | cut -d: -f1 | uniq -c
+```
+
+A gap of several hours in the middle of a working day means traffic stopped reaching the
+proxy, not that authentication is failing.
+
+### One-shot summary
+
+Everything above in a single paste, for sending to support or pasting into a ticket:
+
+```bash
+sudo bash -c '
+echo "=== container ==="
+docker inspect -f "{{.State.Status}} since {{.State.StartedAt}}" radsecproxy
+echo "=== last heartbeat ==="
+docker logs radsecproxy --tail 300 2>&1 | grep "status server response from longfi" | tail -1
+echo "=== message mix, 24h ==="
+docker logs radsecproxy --since 24h 2>&1 | grep -oE "Access-[A-Za-z]+|Accounting-[A-Za-z]+" | sort | uniq -c | sort -rn
+echo "=== realms, 24h ==="
+docker logs radsecproxy --since 24h 2>&1 | grep -oE "@[A-Za-z0-9._-]+" | sort | uniq -c | sort -rn | head -10
+echo "=== errors, last 500 lines ==="
+docker logs radsecproxy --tail 500 2>&1 | grep -iE "error|fail|unable|denied|refused" | tail -20
+'
+```
+
+---
+
 ## The tunnel is genuinely down
 
-Work down this list. Each step rules out one layer.
+Only work through this once `Last beat` has confirmed there is a real problem. Each step
+rules out one layer.
 
 **1. Is the container even running?**
 
@@ -53,7 +219,7 @@ Work down this list. Each step rules out one layer.
 sudo docker compose ps
 ```
 
-`Restarting` means a bad config or unreadable certificates. Go to the logs below.
+`Restarting` means a bad config or unreadable certificates. Go to the logs above.
 
 **2. Does DNS resolve?**
 
@@ -95,44 +261,6 @@ This separates "the network and certificates are fine, radsecproxy is misbehavin
 
 A hostname mismatch here is expected and harmless: `radsecproxy.conf` sets
 `certificateNameCheck off`, so the proxy does not check it either.
-
----
-
-## Logs
-
-**Follow live:**
-
-```bash
-sudo docker compose logs -f radsecproxy
-```
-
-**Recent:**
-
-```bash
-sudo docker compose logs --tail=100 radsecproxy
-```
-
-**Anything that looks like a problem:**
-
-```bash
-sudo docker compose logs --tail=500 radsecproxy | grep -iE 'error|fail|unable|denied|refused'
-```
-
-**Prove the tunnel is alive right now:**
-
-```bash
-sudo docker compose logs --tail=300 radsecproxy | grep 'status server response from longfi' | tail -3
-```
-
-Three recent timestamps means the link is up, whatever `longfi-fetch` says about it.
-
-**Find the connection itself:**
-
-```bash
-sudo docker compose logs radsecproxy | grep 'TLS connection to longfi'
-```
-
-No output does not mean no connection. It can simply have rotated out of the log.
 
 ---
 
