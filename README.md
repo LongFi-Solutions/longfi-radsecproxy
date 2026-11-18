@@ -266,8 +266,12 @@ sudo docker compose up -d --build
 
 Start with `sudo longfi-fetch` — it shows the tunnel state, certificates and expiry in one place.
 
+[COMMANDS.md](COMMANDS.md) is the full operational cheat sheet: a step-by-step path for a
+tunnel that is down, log queries, shared-secret checks and certificate commands.
+
 | Symptom | Likely cause |
 |---|---|
+| `longfi-fetch` says `Tunnel: down` but `Last beat` is recent | The tunnel is fine. The connection line has rotated out of the container log, which is all the tunnel field reads. Trust `Last beat` |
 | `docker ps` shows `Restarting` | Bad config or unreadable certificates. Check `sudo docker compose logs radsecproxy` |
 | `Error reading privatekey` / `Permission denied` | Certificates not owned by `radsec` or not mode 600. Re-run step 4 |
 | `Failed reading certificate file` | A certificate is missing or misnamed. All three must be `ca.pem`, `cert.pem`, `key.pem` |
